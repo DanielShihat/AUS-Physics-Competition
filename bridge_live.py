@@ -1,10 +1,11 @@
-# to run: python3 bridge_live.py /dev/tty.usbmodem1101
+# to run: python3 bridge_live.py /dev/tty.usbmodem11301
 
 
 import sys
+
 import time
 import threading
-from collections import dequ
+from collections import deque
 
 import numpy as np
 import serial
@@ -14,7 +15,7 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 # ----------------------------
 # Config
 # ----------------------------
-BAUD = 460800
+BAUD = 115200
 MAX_SECONDS = 10           # rolling buffer length
 DEFAULT_FS_EST = 200       # used for FFT windowing; we estimate real FS too
 FFT_WINDOW_SECONDS = 4.0   # use last 4 seconds for FFT
@@ -49,11 +50,15 @@ class SerialReader(threading.Thread):
         if not self.ser:
             return
         self.ser.write((s.strip() + "\n").encode("utf-8"))
+        self.ser.flush()  # Ensure command is sent immediately
 
     def run(self):
         self.ser = serial.Serial(self.port, BAUD, timeout=1)
         # Small settle time
         time.sleep(1.0)
+        
+        # Clear any old data in buffer
+        self.ser.reset_input_buffer()
 
         # Optional: stop streaming then start clean
         self.write("STOP")
@@ -268,21 +273,21 @@ class MainWindow(QtWidgets.QWidget):
         self.fftPlot.setLabel("bottom", "frequency (Hz)")
         layout.addWidget(self.fftPlot, 1)
 
-        # Curves: show sensor 0/1/2
+        # Curves: show sensor 0/1/2 (with different colors)
         self.timeCurves = {
-            0: self.timePlot.plot(pen=None, symbol=None),
-            1: self.timePlot.plot(pen=None, symbol=None),
-            2: self.timePlot.plot(pen=None, symbol=None),
+            0: self.timePlot.plot(pen='r', name='Sensor 0'),  # Red
+            1: self.timePlot.plot(pen='g', name='Sensor 1'),  # Green
+            2: self.timePlot.plot(pen='b', name='Sensor 2'),  # Blue
         }
         self.fftCurves = {
-            0: self.fftPlot.plot(pen=None, symbol=None),
-            1: self.fftPlot.plot(pen=None, symbol=None),
-            2: self.fftPlot.plot(pen=None, symbol=None),
+            0: self.fftPlot.plot(pen='r', name='Sensor 0'),  # Red
+            1: self.fftPlot.plot(pen='g', name='Sensor 1'),  # Green
+            2: self.fftPlot.plot(pen='b', name='Sensor 2'),  # Blue
         }
 
         # Buttons connect
         self.btn_cal.clicked.connect(lambda: self.reader.write("CAL"))
-        self.btn_start.clicked.connect(lambda: self.reader.write("START"))
+        self.btn_start.clicked.connect(lambda: (print("[DEBUG] START button clicked"), self.reader.write("START")))
         self.btn_stop.clicked.connect(lambda: self.reader.write("STOP"))
         self.btn_base.clicked.connect(self.model.set_baseline)
 
@@ -311,6 +316,9 @@ class MainWindow(QtWidgets.QWidget):
         parts = line.split(",")
         if len(parts) != 8:
             self.lastMsg = line
+            # Debug: print non-data lines
+            if line and not line.startswith("STREAM"):
+                print(f"[DEBUG] Non-data line: {line}")
             return
         try:
             tms = int(parts[0])
@@ -324,6 +332,9 @@ class MainWindow(QtWidgets.QWidget):
         if sid not in (0, 1, 2):
             return
         self.model.add_sample(tms, sid, ax, ay, az, gx, gy, gz)
+        # Debug: print first few data samples
+        if len(self.model.buffers[sid]) <= 3:
+            print(f"[DEBUG] Received data: sensor {sid}, samples: {len(self.model.buffers[sid])}")
 
     def update_time_plot(self):
         # Show last ~5 seconds
@@ -332,11 +343,13 @@ class MainWindow(QtWidgets.QWidget):
             if series is None:
                 continue
             t, az = series
-            if len(t) < 5:
+            if len(t) < 2:  # Changed from 5 to 2 - show data sooner
                 continue
-            t0 = t[-1] - 5.0
-            mask = t >= t0
-            self.timeCurves[sid].setData(t[mask], az[mask])
+            # Show all data if less than 5 seconds, otherwise last 5 seconds
+            if len(t) > 0:
+                t0 = max(t[0], t[-1] - 5.0)
+                mask = t >= t0
+                self.timeCurves[sid].setData(t[mask], az[mask])
 
     def update_fft_and_status(self):
         # Compute FFT features + update plot

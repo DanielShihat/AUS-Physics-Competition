@@ -46,7 +46,7 @@ bool i2cReadBytes(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false; // repeated start
-  uint8_t n = Wire.requestFrom(addr, len, true);
+  uint8_t n = Wire.requestFrom((uint8_t)addr, (uint8_t)len, (uint8_t)1);
   if (n != len) return false;
   for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
   return true;
@@ -155,7 +155,7 @@ void printHelp() {
 
 // ---------- Setup / loop ----------
 void setup() {
-  Serial.begin(460800);
+  Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000); // fast I2C
 
