@@ -1,5 +1,16 @@
 #include <Wire.h>
+// ===== MOTOR CONTROL =====
+const int MOTOR_PWM_PIN = 9;   // D9 (~PWM)
+int motorPWM = 0;              // 0–255
+bool motorEnabled = false;
 
+void motorApply() {
+  if (!motorEnabled) {
+    analogWrite(MOTOR_PWM_PIN, 0);
+  } else {
+    analogWrite(MOTOR_PWM_PIN, motorPWM);
+  }
+}
 // ---------- Addresses ----------
 static const uint8_t TCA_ADDR = 0x70;   // TCA9548A
 static const uint8_t MPU_ADDR = 0x68;   // MPU6050 (AD0 low)
@@ -158,6 +169,8 @@ void setup() {
   Serial.begin(115200);
   Wire.begin();
   Wire.setClock(400000); // fast I2C
+  pinMode(MOTOR_PWM_PIN, OUTPUT);
+  motorApply();  // ensure motor is OFF at boot
 
   delay(200);
   Serial.println("BOOT");
@@ -181,28 +194,63 @@ void handleCommand(const String &line) {
   s.trim();
   if (s.length() == 0) return;
 
-  if (s.equalsIgnoreCase("START")) {
+  // Normalize once for cleaner parsing
+  String u = s;
+  u.toUpperCase();
+
+  // ===== MOTOR COMMANDS (put EARLY so it works even when not streaming) =====
+  if (u == "MOTORON") {
+    motorEnabled = true;
+    motorApply();
+    Serial.println("MOTOR_ON");
+    return;
+  }
+
+  if (u == "MOTOROFF") {
+    motorEnabled = false;
+    motorApply();
+    Serial.println("MOTOR_OFF");
+    return;
+  }
+
+  if (u.startsWith("MOTOR ")) {
+    int val = s.substring(6).toInt();      // use original 's' to keep spacing/indexing
+    val = constrain(val, 0, 255);
+    motorPWM = val;
+    motorEnabled = true;
+    motorApply();
+    Serial.print("MOTOR_PWM=");
+    Serial.println(motorPWM);
+    return;
+  }
+
+  // ===== EXISTING COMMANDS =====
+  if (u == "START") {
     streaming = true;
     Serial.println("STREAM_ON");
     return;
   }
-  if (s.equalsIgnoreCase("STOP")) {
+
+  if (u == "STOP") {
     streaming = false;
     Serial.println("STREAM_OFF");
     return;
   }
-  if (s.equalsIgnoreCase("CAL")) {
+
+  if (u == "CAL") {
     Serial.println("CAL_BEGIN");
     calibrateGyro(250);
     return;
   }
-  if (s.equalsIgnoreCase("STATUS")) {
+
+  if (u == "STATUS") {
     Serial.print("STATUS,streaming="); Serial.print(streaming ? "1":"0");
     Serial.print(",rate="); Serial.print(sampleRateHz);
     Serial.print(",sensors="); Serial.println(sensorCount);
     return;
   }
-  if (s.startsWith("RATE")) {
+
+  if (u.startsWith("RATE")) {
     int sp = s.indexOf(' ');
     if (sp > 0) {
       int hz = s.substring(sp + 1).toInt();
@@ -217,7 +265,8 @@ void handleCommand(const String &line) {
     }
     return;
   }
-  if (s.startsWith("SENS")) {
+
+  if (u.startsWith("SENS")) {
     int sp = s.indexOf(' ');
     if (sp > 0) {
       int n = s.substring(sp + 1).toInt();
@@ -233,14 +282,13 @@ void handleCommand(const String &line) {
     return;
   }
 
-  if (s.equalsIgnoreCase("HELP")) {
+  if (u == "HELP") {
     printHelp();
     return;
   }
 
   Serial.println("UNKNOWN_CMD");
 }
-
 void loop() {
   // Read commands
   while (Serial.available()) {

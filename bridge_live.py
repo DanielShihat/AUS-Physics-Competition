@@ -27,6 +27,19 @@ DF_THRESHOLD_HZ = 0.30
 DA_THRESHOLD_REL = 0.25
 CONSEC_WINDOWS = 2
 
+# Severity thresholds (percentage relative to baseline)
+# Example: MILD_*_PCT = 20 means 20% higher is mild
+MILD_DF_PCT = 10.0       # 10% frequency change -> mild
+DAMAGED_DF_PCT = 20.0    # 20% -> damaged
+CRITICAL_DF_PCT = 50.0   # 50% -> critical
+
+MILD_A_PCT = 20.0        # 20% amplitude increase -> mild
+DAMAGED_A_PCT = 50.0     # 50% -> damaged
+CRITICAL_A_PCT = 100.0   # 100% (x2) -> critical
+
+# Motor control command format (adjust range if your firmware expects different)
+MOTOR_POWER_FMT = "MOTOR {}"
+
 # ----------------------------
 # Serial reader thread
 # ----------------------------
@@ -95,6 +108,13 @@ class DataModel:
         # Baseline
         self.baseline = None  # dict: sid -> (f1, A1)
         self.consec_bad = 0
+
+        # Severity history for smoothing per sensor (use CONSEC_WINDOWS)
+        self.sev_hist = {
+            0: deque(maxlen=CONSEC_WINDOWS),
+            1: deque(maxlen=CONSEC_WINDOWS),
+            2: deque(maxlen=CONSEC_WINDOWS),
+        }
 
         # Latest computed features
         self.latest_feats = {}  # sid -> dict
@@ -202,32 +222,57 @@ class DataModel:
     def health_status(self):
         with self.lock:
             base = self.baseline
-            consec = self.consec_bad
         if not base:
             return "NO BASELINE", pg.mkColor("w")
 
-        # If any sensor deviates enough, count as bad
-        bad = False
-        for sid, (f0, A0) in base.items():
+        # Only consider MPU 0 (left) and MPU 1 (right)
+        per_sensor_sev = {0: 0, 1: 0}
+
+        def _sev_from_baseline(f0, A0, f1, A1):
+            # Returns 0=healthy,1=mild,2=damaged,3=critical
+            if f0 is None or A0 is None:
+                return 0
+            # percent change in frequency (absolute)
+            df_pct = abs(f1 - f0) / (f0 + 1e-9) * 100.0
+            # percent change in amplitude (increase only)
+            a_pct = (A1 - A0) / (A0 + 1e-9) * 100.0
+            sev = 0
+            if (df_pct >= MILD_DF_PCT) or (a_pct >= MILD_A_PCT):
+                sev = 1
+            if (df_pct >= DAMAGED_DF_PCT) or (a_pct >= DAMAGED_A_PCT):
+                sev = 2
+            if (df_pct >= CRITICAL_DF_PCT) or (a_pct >= CRITICAL_A_PCT):
+                sev = 3
+            return sev
+
+        for sid in (0, 1):
+            base_vals = base.get(sid)
             feats = self.latest_feats.get(sid)
-            if not feats:
-                continue
-            df = abs(feats["f1"] - f0)
-            da = abs(feats["A1"] - A0) / (A0 + 1e-9)
-            if (df > DF_THRESHOLD_HZ) or (da > DA_THRESHOLD_REL):
-                bad = True
+            if (not base_vals) or (not feats):
+                sev = 0
+            else:
+                f0, A0 = base_vals
+                f1, A1 = feats.get("f1"), feats.get("A1")
+                sev = _sev_from_baseline(f0, A0, f1, A1)
 
-        if bad:
-            consec += 1
-        else:
-            consec = max(0, consec - 1)
+            # update history
+            self.sev_hist[sid].append(sev)
+            # stable severity is the max over the recent window
+            stable_sev = max(self.sev_hist[sid]) if len(self.sev_hist[sid]) > 0 else 0
+            per_sensor_sev[sid] = stable_sev
 
-        with self.lock:
-            self.consec_bad = consec
+        # Combined severity = worst of the two
+        combined = max(per_sensor_sev[0], per_sensor_sev[1])
 
-        if consec >= CONSEC_WINDOWS:
-            return "DAMAGED", pg.mkColor("r")
-        return "HEALTHY", pg.mkColor("g")
+        sev_map = {0: "HEALTHY", 1: "MILD", 2: "DAMAGED", 3: "CRITICAL"}
+        color_map = {0: pg.mkColor("g"), 1: pg.mkColor("#ffd54f"), 2: pg.mkColor("#ff8c00"), 3: pg.mkColor("r")}
+
+        left_text = sev_map.get(per_sensor_sev[0], "?")
+        right_text = sev_map.get(per_sensor_sev[1], "?")
+        combined_text = sev_map.get(combined, "?")
+
+        label = f"{combined_text} — L:{left_text}, R:{right_text}"
+        return label, color_map.get(combined, pg.mkColor("w"))
 
 
 # ----------------------------
@@ -251,6 +296,15 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_start = QtWidgets.QPushButton("START stream")
         self.btn_stop = QtWidgets.QPushButton("STOP stream")
         self.btn_base = QtWidgets.QPushButton("SET BASELINE (healthy)")
+        # Motor power controls
+        self.motor_label = QtWidgets.QLabel("Motor Power:")
+        self.motor_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.motor_slider.setRange(0, 255)
+        self.motor_slider.setValue(0)
+        self.motor_spin = QtWidgets.QSpinBox()
+        self.motor_spin.setRange(0, 255)
+        self.motor_spin.setValue(0)
+        self.btn_motor_set = QtWidgets.QPushButton("Set Motor")
         self.status = QtWidgets.QLabel("STATUS: --")
         self.status.setStyleSheet("font-size: 18px; font-weight: bold;")
 
@@ -258,6 +312,10 @@ class MainWindow(QtWidgets.QWidget):
         top.addWidget(self.btn_start)
         top.addWidget(self.btn_stop)
         top.addWidget(self.btn_base)
+        top.addWidget(self.motor_label)
+        top.addWidget(self.motor_slider)
+        top.addWidget(self.motor_spin)
+        top.addWidget(self.btn_motor_set)
         top.addStretch(1)
         top.addWidget(self.status)
         layout.addLayout(top)
@@ -290,6 +348,12 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_start.clicked.connect(lambda: (print("[DEBUG] START button clicked"), self.reader.write("START")))
         self.btn_stop.clicked.connect(lambda: self.reader.write("STOP"))
         self.btn_base.clicked.connect(self.model.set_baseline)
+        # motor control connections
+        self.motor_slider.valueChanged.connect(self.motor_spin.setValue)
+        self.motor_spin.valueChanged.connect(self.motor_slider.setValue)
+        self.btn_motor_set.clicked.connect(self.set_motor_power)
+        # also send when user releases the slider (convenience)
+        self.motor_slider.sliderReleased.connect(lambda: self.reader.write(MOTOR_POWER_FMT.format(self.motor_slider.value())))
 
         # Timers
         self.timeTimer = QtCore.QTimer()
@@ -305,10 +369,30 @@ class MainWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         try:
+            # Ensure motor is off before exiting
+            try:
+                # send motor 0 to stop motor
+                if getattr(self, "reader", None):
+                    try:
+                        self.reader.write(MOTOR_POWER_FMT.format(0))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             self.reader.stop()
         except Exception:
             pass
         event.accept()
+
+    def set_motor_power(self):
+        try:
+            val = int(self.motor_spin.value())
+            # Clamp value to slider/spin range
+            val = max(0, min(255, val))
+            self.motor_slider.setValue(val)
+            self.reader.write(MOTOR_POWER_FMT.format(val))
+        except Exception:
+            pass
 
     def on_serial_line(self, line: str):
         # Non-data lines: BOOT, CAL_OK, etc.
