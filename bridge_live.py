@@ -27,15 +27,11 @@ DF_THRESHOLD_HZ = 0.30
 DA_THRESHOLD_REL = 0.25
 CONSEC_WINDOWS = 2
 
-# Severity thresholds (percentage relative to baseline)
-# Example: MILD_*_PCT = 20 means 20% higher is mild
-MILD_DF_PCT = 10.0       # 10% frequency change -> mild
-DAMAGED_DF_PCT = 20.0    # 20% -> damaged
-CRITICAL_DF_PCT = 50.0   # 50% -> critical
-
-MILD_A_PCT = 20.0        # 20% amplitude increase -> mild
-DAMAGED_A_PCT = 50.0     # 50% -> damaged
-CRITICAL_A_PCT = 100.0   # 100% (x2) -> critical
+# Severity thresholds as multiplicative factors of baseline
+# Example: MILD_FACTOR = 1.2 means measured >= baseline * 1.2 is mild
+MILD_FACTOR = 1.2
+DAMAGED_FACTOR = 1.5
+CRITICAL_FACTOR = 2.0
 
 # Motor control command format (adjust range if your firmware expects different)
 MOTOR_POWER_FMT = "MOTOR {}"
@@ -62,6 +58,11 @@ class SerialReader(threading.Thread):
     def write(self, s: str):
         if not self.ser:
             return
+        # Log outgoing commands for debugging
+        try:
+            print(f"[OUT] {s.strip()}")
+        except Exception:
+            pass
         self.ser.write((s.strip() + "\n").encode("utf-8"))
         self.ser.flush()  # Ensure command is sent immediately
 
@@ -232,16 +233,25 @@ class DataModel:
             # Returns 0=healthy,1=mild,2=damaged,3=critical
             if f0 is None or A0 is None:
                 return 0
-            # percent change in frequency (absolute)
-            df_pct = abs(f1 - f0) / (f0 + 1e-9) * 100.0
-            # percent change in amplitude (increase only)
-            a_pct = (A1 - A0) / (A0 + 1e-9) * 100.0
+            eps = 1e-6
             sev = 0
-            if (df_pct >= MILD_DF_PCT) or (a_pct >= MILD_A_PCT):
+
+            # Frequency ratio (consider only if baseline is sensible)
+            f_ratio = 1.0
+            if f0 > eps and f1 is not None:
+                f_ratio = float(f1) / float(f0)
+
+            # Amplitude ratio (only increases count)
+            a_ratio = 1.0
+            if A0 > eps and A1 is not None:
+                a_ratio = float(A1) / float(A0)
+
+            # Determine severity by comparing ratios to factors
+            if (f_ratio >= MILD_FACTOR) or (a_ratio >= MILD_FACTOR):
                 sev = 1
-            if (df_pct >= DAMAGED_DF_PCT) or (a_pct >= DAMAGED_A_PCT):
+            if (f_ratio >= DAMAGED_FACTOR) or (a_ratio >= DAMAGED_FACTOR):
                 sev = 2
-            if (df_pct >= CRITICAL_DF_PCT) or (a_pct >= CRITICAL_A_PCT):
+            if (f_ratio >= CRITICAL_FACTOR) or (a_ratio >= CRITICAL_FACTOR):
                 sev = 3
             return sev
 
@@ -305,6 +315,10 @@ class MainWindow(QtWidgets.QWidget):
         self.motor_spin.setRange(0, 255)
         self.motor_spin.setValue(0)
         self.btn_motor_set = QtWidgets.QPushButton("Set Motor")
+        self.btn_motor_enable = QtWidgets.QPushButton("Enable Motor")
+        self.btn_motor_enable.setCheckable(True)
+        self.chk_safe_send = QtWidgets.QCheckBox("Safe send (STOP→CMD→START)")
+        self.chk_safe_send.setChecked(True)
         self.status = QtWidgets.QLabel("STATUS: --")
         self.status.setStyleSheet("font-size: 18px; font-weight: bold;")
 
@@ -316,6 +330,8 @@ class MainWindow(QtWidgets.QWidget):
         top.addWidget(self.motor_slider)
         top.addWidget(self.motor_spin)
         top.addWidget(self.btn_motor_set)
+        top.addWidget(self.btn_motor_enable)
+        top.addWidget(self.chk_safe_send)
         top.addStretch(1)
         top.addWidget(self.status)
         layout.addLayout(top)
@@ -352,6 +368,7 @@ class MainWindow(QtWidgets.QWidget):
         self.motor_slider.valueChanged.connect(self.motor_spin.setValue)
         self.motor_spin.valueChanged.connect(self.motor_slider.setValue)
         self.btn_motor_set.clicked.connect(self.set_motor_power)
+        self.btn_motor_enable.toggled.connect(self.toggle_enable_motor)
         # also send when user releases the slider (convenience)
         self.motor_slider.sliderReleased.connect(lambda: self.reader.write(MOTOR_POWER_FMT.format(self.motor_slider.value())))
 
@@ -366,6 +383,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # Serial debug label
         self.lastMsg = ""
+        # Track whether firmware is currently streaming
+        self.streaming_flag = False
 
     def closeEvent(self, event):
         try:
@@ -390,7 +409,40 @@ class MainWindow(QtWidgets.QWidget):
             # Clamp value to slider/spin range
             val = max(0, min(255, val))
             self.motor_slider.setValue(val)
-            self.reader.write(MOTOR_POWER_FMT.format(val))
+            cmd = MOTOR_POWER_FMT.format(val)
+            if self.chk_safe_send.isChecked():
+                threading.Thread(target=self._safe_send_commands, args=([cmd], True), daemon=True).start()
+            else:
+                self.reader.write(cmd)
+        except Exception:
+            pass
+
+    def toggle_enable_motor(self, checked: bool):
+        # Send MOTORON / MOTOROFF safely if requested
+        cmd = "MOTORON" if checked else "MOTOROFF"
+        # Update button text immediately
+        try:
+            self.btn_motor_enable.setText("Disable Motor" if checked else "Enable Motor")
+        except Exception:
+            pass
+        if self.chk_safe_send.isChecked():
+            threading.Thread(target=self._safe_send_commands, args=([cmd], True), daemon=True).start()
+        else:
+            self.reader.write(cmd)
+
+    def _safe_send_commands(self, cmds, restart_stream=True):
+        # Run in background thread to avoid blocking UI.
+        try:
+            was_streaming = getattr(self, "streaming_flag", False)
+            if was_streaming:
+                self.reader.write("STOP")
+                time.sleep(0.12)
+            for c in cmds:
+                self.reader.write(c)
+                time.sleep(0.06)
+            if was_streaming and restart_stream:
+                time.sleep(0.12)
+                self.reader.write("START")
         except Exception:
             pass
 
@@ -400,8 +452,8 @@ class MainWindow(QtWidgets.QWidget):
         parts = line.split(",")
         if len(parts) != 8:
             self.lastMsg = line
-            # Debug: print non-data lines
-            if line and not line.startswith("STREAM"):
+            # Debug: print all non-data lines (including STREAM messages)
+            if line:
                 print(f"[DEBUG] Non-data line: {line}")
             return
         try:
