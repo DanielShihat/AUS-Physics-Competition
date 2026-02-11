@@ -1,8 +1,6 @@
 # to run: python3 bridge_live.py /dev/tty.usbmodem11301
 
-
 import sys
-
 import time
 import threading
 from collections import deque
@@ -16,18 +14,35 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 # Config
 # ----------------------------
 BAUD = 115200
-MAX_SECONDS = 10           # rolling buffer length
-DEFAULT_FS_EST = 200       # used for FFT windowing; we estimate real FS too
-FFT_WINDOW_SECONDS = 4.0   # use last 4 seconds for FFT
-FFT_UPDATE_HZ = 2.0        # FFT recompute rate
-TIME_UPDATE_HZ = 30.0      # GUI refresh rate
 
-# Detection thresholds (tune after first run)
-DF_THRESHOLD_HZ = 0.30
-DA_THRESHOLD_REL = 0.25
-# Require a few consecutive bad FFT windows before status changes,
-# so the UI is less "jumpy".
-CONSEC_WINDOWS = 4
+MAX_SECONDS = 10            # rolling buffer length
+DEFAULT_FS_EST = 200        # used for FFT windowing; we estimate real FS too
+
+FFT_WINDOW_SECONDS = 4.0    # use last 4 seconds for FFT
+FFT_UPDATE_HZ = 1.0         # was 2.0; lower = more stable / less CPU
+TIME_UPDATE_HZ = 20.0       # was 30.0; lower = less UI load
+
+# ---- Robustness / Stability knobs ----
+QUIET_NON_DATA = True        # set False if you really want debug spam
+PRINT_EVERY_N_DROP = 100     # print 1 per N drops (only if QUIET_NON_DATA=False)
+
+# Smoothing (EMA): smaller = smoother, less sensitive
+EMA_ALPHA_F = 0.15   # f1 smoothing (try 0.10–0.20)
+EMA_ALPHA_A = 0.12   # A1 smoothing (try 0.08–0.15)
+
+# Baseline averaging: how many FFT windows to average
+BASELINE_TARGET_WINDOWS = 10  # try 8–14
+
+# Status smoothing: require sustained deviation
+CONSEC_WINDOWS = 5
+
+# Classification thresholds (amplitude change relative to baseline)
+# da = |A1 - A0| / A0
+DA_HEALTHY_MAX = 0.35   # <35% change = healthy (less sensitive than before)
+DA_MILD_MAX    = 0.70   # 35–70% = mild
+DA_DAMAGED_MAX = 1.20   # 70–120% = damaged
+# >120% = critical
+
 
 # ----------------------------
 # Serial reader thread
@@ -51,18 +66,18 @@ class SerialReader(threading.Thread):
     def write(self, s: str):
         if not self.ser:
             return
-        self.ser.write((s.strip() + "\n").encode("utf-8"))
-        self.ser.flush()  # Ensure command is sent immediately
+        try:
+            self.ser.write((s.strip() + "\n").encode("utf-8"))
+            self.ser.flush()
+        except Exception:
+            pass
 
     def run(self):
         self.ser = serial.Serial(self.port, BAUD, timeout=1)
-        # Small settle time
         time.sleep(1.0)
-        
-        # Clear any old data in buffer
         self.ser.reset_input_buffer()
 
-        # Optional: stop streaming then start clean
+        # Start clean
         self.write("STOP")
         time.sleep(0.1)
         self.write("STATUS")
@@ -73,7 +88,6 @@ class SerialReader(threading.Thread):
                 if line:
                     self.on_line(line)
             except Exception:
-                # keep going (USB hiccups happen)
                 continue
 
 
@@ -82,40 +96,42 @@ class SerialReader(threading.Thread):
 # ----------------------------
 class DataModel:
     def __init__(self):
-        # Per sensor buffers
-        self.buffers = {
-            0: deque(),
-            1: deque(),
-            2: deque()
-        }
-        self.maxlen = int(MAX_SECONDS * DEFAULT_FS_EST * 2)  # over-allocate; we cap by time anyway
+        self.buffers = {0: deque(), 1: deque(), 2: deque()}
+        self.maxlen = int(MAX_SECONDS * DEFAULT_FS_EST * 2)
 
-        # For estimating actual sample rate per sensor
+        # FS estimate
         self.last_tms = {0: None, 1: None, 2: None}
         self.dt_hist = {0: deque(maxlen=400), 1: deque(maxlen=400), 2: deque(maxlen=400)}
 
+        # Smoothed features (EMA)
+        self.smooth = {}  # sid -> {"f1":..., "A1":...}
+        self.alpha_f = EMA_ALPHA_F
+        self.alpha_A = EMA_ALPHA_A
+
         # Baseline
-        self.baseline = None  # dict: sid -> (f1, A1)
-        self.consec_bad = 0
+        self.baseline = None             # dict: sid -> (f0, A0)
+        self.baseline_collecting = False
+        self.baseline_samples = {0: [], 1: [], 2: []}
+        self.baseline_target = BASELINE_TARGET_WINDOWS
 
         # Latest computed features
         self.latest_feats = {}  # sid -> dict
+
+        # Status smoothing
+        self.consec_bad = 0
 
         # Thread safety
         self.lock = threading.Lock()
 
     def add_sample(self, tms, sid, ax, ay, az, gx, gy, gz):
         with self.lock:
-            # Keep only recent by time (rolling)
             t = tms / 1000.0
             self.buffers[sid].append((t, ax, ay, az, gx, gy, gz))
 
-            # Cap by time, not just count
             cutoff = t - MAX_SECONDS
             while self.buffers[sid] and self.buffers[sid][0][0] < cutoff:
                 self.buffers[sid].popleft()
 
-            # dt history for FS estimate
             lt = self.last_tms[sid]
             if lt is not None:
                 dt = (tms - lt) / 1000.0
@@ -140,7 +156,7 @@ class DataModel:
             return None
         arr = np.array(data, dtype=np.float64)
         t = arr[:, 0]
-        az = arr[:, 3]  # ax,ay,az index: (t,ax,ay,az,...) => az = col 3
+        az = arr[:, 3]
         return t, az
 
     def compute_fft_features(self, sid, fmin=1.0, fmax=40.0):
@@ -150,7 +166,6 @@ class DataModel:
         t, az = series
         fs = self.estimate_fs(sid)
 
-        # Need enough samples for the FFT window
         window = FFT_WINDOW_SECONDS
         t_end = t[-1]
         t_start = t_end - window
@@ -159,19 +174,15 @@ class DataModel:
             return None
 
         x = az[mask].astype(np.float64)
-        # Remove DC
         x = x - np.mean(x)
 
-        # Hann window
         w = np.hanning(len(x))
         xw = x * w
 
-        # FFT
         X = np.fft.rfft(xw)
-        freqs = np.fft.rfftfreq(len(xw), d=1.0/fs)
+        freqs = np.fft.rfftfreq(len(xw), d=1.0 / fs)
         mag = np.abs(X)
 
-        # band select
         band = (freqs >= fmin) & (freqs <= fmax)
         if not np.any(band):
             return None
@@ -182,74 +193,98 @@ class DataModel:
         f1 = float(freqs_b[idx])
         A1 = float(mag_b[idx])
 
-        return {
-            "fs": fs,
-            "freqs": freqs_b,
-            "mag": mag_b,
-            "f1": f1,
-            "A1": A1
-        }
+        return {"fs": fs, "freqs": freqs_b, "mag": mag_b, "f1": f1, "A1": A1}
 
-    def set_baseline(self):
-        base = {}
-        for sid in (0, 1, 2):
-            feats = self.compute_fft_features(sid)
-            if feats is None:
-                continue
-            base[sid] = (feats["f1"], feats["A1"])
+    def update_smoothed(self, sid, feats):
+        """EMA smooth f1/A1 so tiny FFT jitters don't flip the status."""
+        f1 = feats["f1"]
+        A1 = feats["A1"]
+
         with self.lock:
-            self.baseline = base if base else None
+            s = self.smooth.get(sid)
+            if s is None:
+                self.smooth[sid] = {"f1": f1, "A1": A1}
+                return dict(self.smooth[sid])
+
+            s["f1"] = (1 - self.alpha_f) * s["f1"] + self.alpha_f * f1
+            s["A1"] = (1 - self.alpha_A) * s["A1"] + self.alpha_A * A1
+            return dict(s)
+
+    def start_baseline(self):
+        """Start collecting baseline over multiple FFT windows."""
+        with self.lock:
+            self.baseline = None
             self.consec_bad = 0
+            self.baseline_collecting = True
+            for sid in (0, 1, 2):
+                self.baseline_samples[sid] = []
+
+    def baseline_progress(self, sids=(0, 1)):
+        with self.lock:
+            if not self.baseline_collecting and self.baseline:
+                return (self.baseline_target, self.baseline_target)
+            counts = [len(self.baseline_samples[s]) for s in sids]
+        return (min(counts) if counts else 0, self.baseline_target)
+
+    def maybe_collect_baseline(self, sid, f1_s, A1_s, use_sids=(0, 1)):
+        """Collect smoothed features until we have enough windows, then average baseline."""
+        with self.lock:
+            if not self.baseline_collecting:
+                return
+
+            if sid in use_sids and len(self.baseline_samples[sid]) < self.baseline_target:
+                self.baseline_samples[sid].append((f1_s, A1_s))
+
+            ready = all(len(self.baseline_samples[s]) >= self.baseline_target for s in use_sids)
+            if ready:
+                base = {}
+                for s in use_sids:
+                    arr = np.array(self.baseline_samples[s], dtype=np.float64)
+                    f0 = float(np.mean(arr[:, 0]))
+                    A0 = float(np.mean(arr[:, 1]))
+                    base[s] = (f0, A0)
+                self.baseline = base
+                self.consec_bad = 0
+                self.baseline_collecting = False
 
     def health_status(self):
         with self.lock:
             base = self.baseline
             consec = self.consec_bad
             latest = dict(self.latest_feats)
+            collecting = self.baseline_collecting
 
-        # No baseline set yet
+        if collecting and not base:
+            return "BASELINE CAPTURING", pg.mkColor("w"), {0: "n/a", 1: "n/a", 2: "n/a"}
+
         if not base:
-            # Per‑sensor info is not meaningful yet
-            per_sid = {0: "n/a", 1: "n/a", 2: "n/a"}
-            return "NO BASELINE", pg.mkColor("w"), per_sid
+            return "NO BASELINE", pg.mkColor("w"), {0: "n/a", 1: "n/a", 2: "n/a"}
 
-        # Helper: classify a single sensor's deviation into severity level,
-        # based mainly on percentage amplitude increase (da).
-        # da is |A1 - A0| / A0  →  0.2 = 20% change, etc.
-        #
-        # Thresholds (you can tweak these):
-        #   < 20%   → healthy
-        #   20–50%  → mild
-        #   50–100% → damaged
-        #   > 100%  → critical
-        #
-        # We still compute df (frequency shift) but mainly use da for clarity.
-        def classify(df, da):
-            if da < 0.20:
-                return 0  # healthy
-            elif da < 0.50:
-                return 1  # mild (≥20% change)
-            elif da < 1.00:
-                return 2  # damaged (≥50% change)
+        def classify(da):
+            if da < DA_HEALTHY_MAX:
+                return 0
+            elif da < DA_MILD_MAX:
+                return 1
+            elif da < DA_DAMAGED_MAX:
+                return 2
             else:
-                return 3  # critical (≥100% change)
+                return 3
 
-        per_sid_level = {}   # sid -> numeric level
+        per_sid_level = {}
         worst_level = 0
 
-        # Compute per‑sensor severities where we have both baseline + latest feats
         for sid, (f0, A0) in base.items():
             feats = latest.get(sid)
             if not feats:
                 continue
-            df = abs(feats["f1"] - f0)
-            da = abs(feats["A1"] - A0) / (A0 + 1e-9)
-            lvl = classify(df, da)
-            per_sid_level[sid] = lvl
-            if lvl > worst_level:
-                worst_level = lvl
 
-        # Smooth over time using consec_bad (like before, but using worst_level)
+            da = abs(feats["A1"] - A0) / (A0 + 1e-9)
+            lvl = classify(da)
+
+            per_sid_level[sid] = lvl
+            worst_level = max(worst_level, lvl)
+
+        # smooth status changes over time
         if worst_level > 0:
             consec += 1
         else:
@@ -260,18 +295,12 @@ class DataModel:
 
         level_to_overall = {
             0: ("HEALTHY", pg.mkColor("g")),
-            1: ("MILD",    pg.mkColor("y")),
+            1: ("MILD", pg.mkColor("y")),
             2: ("DAMAGED", pg.mkColor("orange")),
             3: ("CRITICAL", pg.mkColor("r")),
         }
-        level_to_label = {
-            0: "healthy",
-            1: "mild",
-            2: "damaged",
-            3: "critical",
-        }
+        level_to_label = {0: "healthy", 1: "mild", 2: "damaged", 3: "critical"}
 
-        # Only treat as non‑healthy if deviation persists for CONSEC_WINDOWS
         if consec >= CONSEC_WINDOWS and worst_level > 0:
             overall_level = worst_level
         else:
@@ -279,14 +308,10 @@ class DataModel:
 
         overall_text, overall_color = level_to_overall[overall_level]
 
-        # Build friendly per‑sensor labels (for UI: LEFT=0, RIGHT=1, etc.)
         per_sid_labels = {}
         for sid in (0, 1, 2):
             lvl = per_sid_level.get(sid, None)
-            if lvl is None:
-                per_sid_labels[sid] = "n/a"
-            else:
-                per_sid_labels[sid] = level_to_label[lvl]
+            per_sid_labels[sid] = "n/a" if lvl is None else level_to_label[lvl]
 
         return overall_text, overall_color, per_sid_labels
 
@@ -297,21 +322,23 @@ class DataModel:
 class MainWindow(QtWidgets.QWidget):
     def __init__(self, port):
         super().__init__()
-        self.setWindowTitle("Bridge Vibration Monitor (Live + FFT + Baseline)")
+        self.setWindowTitle("Bridge Vibration Monitor (Live + FFT + Smoothed Baseline)")
 
         self.model = DataModel()
         self.reader = SerialReader(port, self.on_serial_line)
         self.reader.start()
 
-        # UI layout
+        # log controls
+        self.drop_count = 0
+        self.last_nondata_print = 0.0
+
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Top controls
         top = QtWidgets.QHBoxLayout()
         self.btn_cal = QtWidgets.QPushButton("CAL (keep still)")
         self.btn_start = QtWidgets.QPushButton("START stream")
         self.btn_stop = QtWidgets.QPushButton("STOP stream")
-        self.btn_base = QtWidgets.QPushButton("SET BASELINE (healthy)")
+        self.btn_base = QtWidgets.QPushButton("SET BASELINE (avg)")
         self.status = QtWidgets.QLabel("STATUS: --")
         self.status.setStyleSheet("font-size: 18px; font-weight: bold;")
 
@@ -323,7 +350,7 @@ class MainWindow(QtWidgets.QWidget):
         top.addWidget(self.status)
         layout.addLayout(top)
 
-        # Motor controls (enable + power slider)
+        # Motor controls
         motor_layout = QtWidgets.QHBoxLayout()
         self.chk_motor = QtWidgets.QCheckBox("Motor enabled")
         self.motorSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
@@ -346,25 +373,24 @@ class MainWindow(QtWidgets.QWidget):
         self.fftPlot.setLabel("bottom", "frequency (Hz)")
         layout.addWidget(self.fftPlot, 1)
 
-        # Curves: show sensor 0/1/2 (with different colors)
         self.timeCurves = {
-            0: self.timePlot.plot(pen='r', name='Sensor 0'),  # Red
-            1: self.timePlot.plot(pen='g', name='Sensor 1'),  # Green
-            2: self.timePlot.plot(pen='b', name='Sensor 2'),  # Blue
+            0: self.timePlot.plot(pen='r', name='Sensor 0'),
+            1: self.timePlot.plot(pen='g', name='Sensor 1'),
+            2: self.timePlot.plot(pen='b', name='Sensor 2'),
         }
         self.fftCurves = {
-            0: self.fftPlot.plot(pen='r', name='Sensor 0'),  # Red
-            1: self.fftPlot.plot(pen='g', name='Sensor 1'),  # Green
-            2: self.fftPlot.plot(pen='b', name='Sensor 2'),  # Blue
+            0: self.fftPlot.plot(pen='r', name='Sensor 0'),
+            1: self.fftPlot.plot(pen='g', name='Sensor 1'),
+            2: self.fftPlot.plot(pen='b', name='Sensor 2'),
         }
 
-        # Buttons connect
+        # Button hooks
         self.btn_cal.clicked.connect(lambda: self.reader.write("CAL"))
         self.btn_start.clicked.connect(lambda: (print("[DEBUG] START button clicked"), self.reader.write("START")))
         self.btn_stop.clicked.connect(lambda: self.reader.write("STOP"))
-        self.btn_base.clicked.connect(self.model.set_baseline)
+        self.btn_base.clicked.connect(self.model.start_baseline)
+
         self.chk_motor.toggled.connect(self.on_motor_toggled)
-        # Only update label on value change; send command when user releases slider
         self.motorSlider.valueChanged.connect(self.on_motor_slider)
         self.motorSlider.sliderReleased.connect(self.on_motor_slider_released)
 
@@ -377,7 +403,6 @@ class MainWindow(QtWidgets.QWidget):
         self.fftTimer.timeout.connect(self.update_fft_and_status)
         self.fftTimer.start(int(1000 / FFT_UPDATE_HZ))
 
-        # Serial debug label
         self.lastMsg = ""
 
     def closeEvent(self, event):
@@ -391,36 +416,52 @@ class MainWindow(QtWidgets.QWidget):
     # Motor control callbacks
     # ----------------------------
     def on_motor_toggled(self, checked: bool):
-        """Enable/disable motor on the Arduino."""
         if checked:
-            # Turn motor on and set current power
             val = self.motorSlider.value()
             self.reader.write("MOTORON")
             self.reader.write(f"MOTOR {val}")
         else:
-            # Turn motor off
             self.reader.write("MOTOROFF")
 
     def on_motor_slider(self, val: int):
-        """Update motor power label (0–255). Actual command is sent on release."""
         self.motorLabel.setText(f"Power: {val}")
 
     def on_motor_slider_released(self):
-        """Send motor power command once when the user lets go of the slider."""
         if self.chk_motor.isChecked():
             val = self.motorSlider.value()
             self.reader.write(f"MOTOR {val}")
 
+    # ----------------------------
+    # Serial parsing (less spam)
+    # ----------------------------
     def on_serial_line(self, line: str):
-        # Non-data lines: BOOT, CAL_OK, etc.
-        # Data lines should be: tms,sid,ax,ay,az,gx,gy,gz
         parts = line.split(",")
+
+        # Non-data lines
         if len(parts) != 8:
             self.lastMsg = line
-            # Debug: print non-data lines
+
+            # tame the spam so UI doesn't "buffer"
+            if line.startswith("DROP"):
+                self.drop_count += 1
+                if (not QUIET_NON_DATA) and (self.drop_count % PRINT_EVERY_N_DROP == 0):
+                    print(f"[DEBUG] DROP x{self.drop_count} (latest: {line})")
+                return
+
+            if line.startswith("MPU_RECOVER"):
+                if not QUIET_NON_DATA:
+                    now = time.time()
+                    if now - self.last_nondata_print > 0.5:
+                        print(f"[DEBUG] {line}")
+                        self.last_nondata_print = now
+                return
+
             if line and not line.startswith("STREAM"):
-                print(f"[DEBUG] Non-data line: {line}")
+                if not QUIET_NON_DATA:
+                    print(f"[DEBUG] Non-data line: {line}")
             return
+
+        # Data line: tms,sid,ax,ay,az,gx,gy,gz
         try:
             tms = int(parts[0])
             sid = int(parts[1])
@@ -432,43 +473,63 @@ class MainWindow(QtWidgets.QWidget):
 
         if sid not in (0, 1, 2):
             return
-        self.model.add_sample(tms, sid, ax, ay, az, gx, gy, gz)
-        # Debug: print first few data samples
-        if len(self.model.buffers[sid]) <= 3:
-            print(f"[DEBUG] Received data: sensor {sid}, samples: {len(self.model.buffers[sid])}")
 
+        self.model.add_sample(tms, sid, ax, ay, az, gx, gy, gz)
+
+        if not QUIET_NON_DATA:
+            with self.model.lock:
+                if len(self.model.buffers[sid]) <= 3:
+                    print(f"[DEBUG] Received data: sensor {sid}, samples: {len(self.model.buffers[sid])}")
+
+    # ----------------------------
+    # Plot updates
+    # ----------------------------
     def update_time_plot(self):
-        # Show last ~5 seconds
         for sid in (0, 1, 2):
             series = self.model.get_series(sid)
             if series is None:
                 continue
             t, az = series
-            if len(t) < 2:  # Changed from 5 to 2 - show data sooner
+            if len(t) < 2:
                 continue
-            # Show all data if less than 5 seconds, otherwise last 5 seconds
-            if len(t) > 0:
-                t0 = max(t[0], t[-1] - 5.0)
-                mask = t >= t0
-                self.timeCurves[sid].setData(t[mask], az[mask])
+            t0 = max(t[0], t[-1] - 5.0)
+            mask = t >= t0
+            self.timeCurves[sid].setData(t[mask], az[mask])
 
     def update_fft_and_status(self):
-        # Compute FFT features + update plot
+        # Update FFT plot + smoothed features
         for sid in (0, 1, 2):
             feats = self.model.compute_fft_features(sid)
             if feats is None:
                 continue
-            self.model.latest_feats[sid] = feats
+
+            # plot raw spectrum
             self.fftCurves[sid].setData(feats["freqs"], feats["mag"])
 
+            # smooth f1/A1 for decisions
+            s = self.model.update_smoothed(sid, feats)
+            feats_sm = dict(feats)
+            feats_sm["f1"] = s["f1"]
+            feats_sm["A1"] = s["A1"]
+
+            with self.model.lock:
+                self.model.latest_feats[sid] = feats_sm
+
+            # collect baseline (average over multiple FFT windows)
+            self.model.maybe_collect_baseline(sid, feats_sm["f1"], feats_sm["A1"], use_sids=(0, 1))
+
         overall, color, per_sid = self.model.health_status()
-        # Map sensors to sides we actually use: 0 = LEFT, 1 = RIGHT
         left = per_sid.get(0, "n/a")
         right = per_sid.get(1, "n/a")
 
-        # Show overall status plus per‑side info (no MID)
-        self.status.setText(f"STATUS: {overall} | LEFT: {left} | RIGHT: {right}")
-        # Set label color
+        # baseline progress text
+        got, need = self.model.baseline_progress((0, 1))
+        if overall == "BASELINE CAPTURING":
+            msg = f"STATUS: {overall} ({got}/{need}) | LEFT: n/a | RIGHT: n/a"
+        else:
+            msg = f"STATUS: {overall} | LEFT: {left} | RIGHT: {right}"
+
+        self.status.setText(msg)
         self.status.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color.name()};")
 
 
@@ -483,6 +544,7 @@ def main():
     w.resize(1200, 700)
     w.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
