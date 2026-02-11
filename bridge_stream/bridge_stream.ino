@@ -27,9 +27,10 @@ static const uint8_t REG_INT_ENABLE     = 0x38;
 static const uint8_t REG_ACCEL_XOUT_H   = 0x3B;
 
 // ===================== Streaming config =====================
+// Default: soften workload a bit and only use 2 sensors (0=LEFT, 1=RIGHT)
 volatile bool streaming = false;
 uint16_t sampleRateHz = 200; // loop reads all sensors each tick
-uint8_t sensorCount = 3;     // 2 or 3 recommended
+uint8_t sensorCount = 2;     // we only use sensors 0 and 1 by default
 
 // Fixed-rate scheduler
 uint32_t nextTickUs = 0;
@@ -136,7 +137,8 @@ bool mpuReadRaw(uint8_t ch, int16_t &ax, int16_t &ay, int16_t &az,
 }
 
 void calibrateGyro(uint8_t samples = 200) {
-  for (uint8_t s = 0; s < 3; s++) gyroOffsets[s] = Offsets();
+  // Reset offsets only for the sensors we actually use
+  for (uint8_t s = 0; s < sensorCount; s++) gyroOffsets[s] = Offsets();
 
   int32_t sumGx[3] = {0,0,0}, sumGy[3] = {0,0,0}, sumGz[3] = {0,0,0};
   uint16_t count[3] = {0,0,0};
@@ -190,8 +192,8 @@ void setup() {
   delay(200);
   Serial.println("BOOT");
 
-  // Init sensors on channels 0..2
-  for (uint8_t sid = 0; sid < 3; sid++) {
+  // Init sensors on channels 0..(sensorCount-1)
+  for (uint8_t sid = 0; sid < sensorCount; sid++) {
     bool ok = mpuInitOne(sid);
     Serial.print("MPU_INIT,"); Serial.print(sid); Serial.print(",");
     Serial.println(ok ? "OK" : "FAIL");
