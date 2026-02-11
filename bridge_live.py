@@ -18,23 +18,23 @@ BAUD = 115200
 MAX_SECONDS = 10            # rolling buffer length
 DEFAULT_FS_EST = 200        # used for FFT windowing; we estimate real FS too
 
-FFT_WINDOW_SECONDS = 4.0    # use last 4 seconds for FFT
-FFT_UPDATE_HZ = 1.0         # was 2.0; lower = more stable / less CPU
+FFT_WINDOW_SECONDS = 2.0    # use last 2 seconds for FFT (faster detection)
+FFT_UPDATE_HZ = 5.0         # update FFT 5x per second (faster damage detection)
 TIME_UPDATE_HZ = 20.0       # was 30.0; lower = less UI load
 
 # ---- Robustness / Stability knobs ----
 QUIET_NON_DATA = True        # set False if you really want debug spam
 PRINT_EVERY_N_DROP = 100     # print 1 per N drops (only if QUIET_NON_DATA=False)
 
-# Smoothing (EMA): smaller = smoother, less sensitive
-EMA_ALPHA_F = 0.15   # f1 smoothing (try 0.10–0.20)
-EMA_ALPHA_A = 0.12   # A1 smoothing (try 0.08–0.15)
+# Smoothing (EMA): larger = more responsive, less smoothing
+EMA_ALPHA_F = 0.35   # f1 smoothing (increased for faster response)
+EMA_ALPHA_A = 0.35   # A1 smoothing (increased for faster response)
 
 # Baseline averaging: how many FFT windows to average
-BASELINE_TARGET_WINDOWS = 10  # try 8–14
+BASELINE_TARGET_WINDOWS = 5  # reduced from 10 for faster baseline establishment
 
 # Status smoothing: require sustained deviation
-CONSEC_WINDOWS = 5
+CONSEC_WINDOWS = 2  # reduced from 5 for faster detection (2 consecutive bad windows)
 
 # Classification thresholds (amplitude change relative to baseline)
 # da = |A1 - A0| / A0
